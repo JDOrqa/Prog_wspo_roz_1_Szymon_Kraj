@@ -1,132 +1,245 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include <pthread.h>
-#include <string.h>
 #include <time.h>
 
+/* -------------------------------------------------------------------------
+ * Stałe – rozmiary dla docelowej skali
+ * ---------------------------------------------------------------------- */
 #define MAX_USERS    10000
-#define MAX_PRODS    1000
-#define TOP_K        50
-#define EPSILON      1e-12
+#define MAX_PRODUCTS 1000
+#define MAX_LINE     256        
+#define TOP_K        5
+
+/* -------------------------------------------------------------------------
+ * Dane globalne (wypełniane podczas wczytywania)
+ * ---------------------------------------------------------------------- */
+static float ratings[MAX_USERS][MAX_PRODUCTS];   /* macierz ocen (rzadka)   */
+static float sim_par[MAX_USERS][MAX_USERS];      /* wynik równoległy        */
+static float sim_seq[MAX_USERS][MAX_USERS];      /* wynik sekwencyjny       */
+static float norm[MAX_USERS];                    /* pre‑obliczone normy     */
+
+static int num_users    = MAX_USERS;
+static int num_products = MAX_PRODUCTS;
+
+/* -------------------------------------------------------------------------
+ * Struktury dla wątków
+ * ---------------------------------------------------------------------- */
+typedef struct {
+    int start_row;      /* pierwszy wiersz obsługiwany przez wątek */
+    int end_row;        /* ostatni wiersz (wyłączny)                */
+    int thread_id;
+    float (*out)[MAX_USERS]; /* wskaźnik do tablicy wyjściowej      */
+} ThreadArgs;
 
 typedef struct {
-    int prod_id;
-    double rating;
-} RatingByUser;
+    int   product;
+    float score;
+} Rec;
 
-typedef struct {
-    int user_id;
-    double rating;
-} RatingByProduct;
-
-RatingByUser *user_items[MAX_USERS];
-int user_items_cnt[MAX_USERS];
-
-RatingByProduct *prod_users[MAX_PRODS];
-int prod_users_cnt[MAX_PRODS];
-
-double norms[MAX_USERS];
-
-
-int cmp_user_by_prod(const void *a, const void *b) {
-    return ((RatingByUser*)a)->prod_id - ((RatingByUser*)b)->prod_id;
+/* =========================================================================
+ * PODOBIEŃSTWO COSINUSOWE – wersja z pre‑obliczonymi normami
+ * ====================================================================== */
+static inline float cosine_similarity(int u, int v) {
+    float dot = 0.0f;
+    for (int p = 0; p < num_products; p++)
+        dot += ratings[u][p] * ratings[v][p];
+    if (norm[u] < 1e-9f || norm[v] < 1e-9f) return 0.0f;
+    return dot / (norm[u] * norm[v]);
 }
 
-int load_ratings(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) return 0;
-
-    for (int i = 0; i < MAX_USERS; i++) user_items_cnt[i] = 0;
-    for (int p = 0; p < MAX_PRODS; p++) prod_users_cnt[p] = 0;
-
-    int uid, pid, total = 0;
-    double rate;
-    int *user_temp = calloc(MAX_USERS, sizeof(int));
-    int *prod_temp = calloc(MAX_PRODS, sizeof(int));
-    if (!user_temp || !prod_temp) { fclose(f); return 0; }
-
-    // 1. przebieg – zliczanie
-    while (fscanf(f, "%d,%d,%lf", &uid, &pid, &rate) == 3) {
-        if (uid < 1 || uid > MAX_USERS || pid < 1 || pid > MAX_PRODS) continue;
-        user_temp[uid-1]++;
-        prod_temp[pid-1]++;
-        total++;
+/* -------------------------------------------------------------------------
+ * Obliczenie norm wektorów ocen (długość euklidesowa)
+ * ---------------------------------------------------------------------- */
+static void compute_norms(void) {
+    for (int u = 0; u < num_users; u++) {
+        float sum = 0.0f;
+        for (int p = 0; p < num_products; p++)
+            sum += ratings[u][p] * ratings[u][p];
+        norm[u] = sqrtf(sum);
     }
-    rewind(f);
-
-    // Alokacja
-    for (int i = 0; i < MAX_USERS; i++)
-        if (user_temp[i])
-            user_items[i] = malloc(user_temp[i] * sizeof(RatingByUser));
-    for (int p = 0; p < MAX_PRODS; p++)
-        if (prod_temp[p])
-            prod_users[p] = malloc(prod_temp[p] * sizeof(RatingByProduct));
-
-    memset(user_temp, 0, MAX_USERS * sizeof(int));
-    memset(prod_temp, 0, MAX_PRODS * sizeof(int));
-
-    // 2. przebieg – wypełnienie
-    while (fscanf(f, "%d,%d,%lf", &uid, &pid, &rate) == 3) {
-        if (uid < 1 || uid > MAX_USERS || pid < 1 || pid > MAX_PRODS) continue;
-        int u = uid-1, p = pid-1;
-
-        int idx_u = user_temp[u]++;
-        user_items[u][idx_u].prod_id = p;
-        user_items[u][idx_u].rating = rate;
-        user_items_cnt[u]++;
-
-        int idx_p = prod_temp[p]++;
-        prod_users[p][idx_p].user_id = u;
-        prod_users[p][idx_p].rating = rate;
-        prod_users_cnt[p]++;
-    }
-
-    fclose(f);
-    free(user_temp);
-    free(prod_temp);
-
-    // Sortowanie list użytkowników
-    for (int i = 0; i < MAX_USERS; i++)
-        if (user_items_cnt[i] > 0)
-            qsort(user_items[i], user_items_cnt[i], sizeof(RatingByUser), cmp_user_by_prod);
-
-    printf("Wczytano %d ocen.\n", total);
-    return 1;
 }
 
+/* =========================================================================
+ * FUNKCJA WĄTKU – oblicza podobieństwo dla przydzielonych wierszy
+ * ====================================================================== */
+static void *thread_func(void *arg) {
+    ThreadArgs *a = (ThreadArgs *)arg;
+    for (int i = a->start_row; i < a->end_row; i++)
+        for (int j = 0; j < num_users; j++)
+            a->out[i][j] = cosine_similarity(i, j);
+    return NULL;
+}
 
-void compute_norms() {
-    for (int u = 0; u < MAX_USERS; u++) {
-        double sum = 0.0;
-        for (int i = 0; i < user_items_cnt[u]; i++) {
-            double r = user_items[u][i].rating;
-            sum += r * r;
+/* =========================================================================
+ * BUDOWANIE MACIERZY PODOBIEŃSTWA – równolegle
+ * ====================================================================== */
+static double build_similarity_parallel(int n_threads,
+                                        float out[MAX_USERS][MAX_USERS]) {
+    memset(out, 0, sizeof(float) * MAX_USERS * MAX_USERS);
+
+    pthread_t   *threads = malloc((size_t)n_threads * sizeof(pthread_t));
+    ThreadArgs  *args    = malloc((size_t)n_threads * sizeof(ThreadArgs));
+    if (!threads || !args) { perror("malloc"); exit(1); }
+
+    int base  = num_users / n_threads;
+    int extra = num_users % n_threads;
+    int row   = 0;
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    for (int t = 0; t < n_threads; t++) {
+        int load = base + (t < extra ? 1 : 0);
+        args[t].thread_id = t;
+        args[t].start_row = row;
+        args[t].end_row   = row + load;
+        args[t].out       = out;
+        row += load;
+        pthread_create(&threads[t], NULL, thread_func, &args[t]);
+    }
+    for (int t = 0; t < n_threads; t++)
+        pthread_join(threads[t], NULL);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    free(threads);
+    free(args);
+
+    return (t_end.tv_sec - t_start.tv_sec) +
+           (t_end.tv_nsec - t_start.tv_nsec) * 1e-9;
+}
+
+/* =========================================================================
+ * BUDOWANIE MACIERZY PODOBIEŃSTWA – sekwencyjnie
+ * ====================================================================== */
+static double build_similarity_sequential(float out[MAX_USERS][MAX_USERS]) {
+    memset(out, 0, sizeof(float) * MAX_USERS * MAX_USERS);
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    for (int i = 0; i < num_users; i++)
+        for (int j = 0; j < num_users; j++)
+            out[i][j] = cosine_similarity(i, j);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    return (t_end.tv_sec - t_start.tv_sec) +
+           (t_end.tv_nsec - t_start.tv_nsec) * 1e-9;
+}
+
+/* =========================================================================
+ * WERYFIKACJA – porównanie całych macierzy (dla pełnego zakresu)
+ * (dla 10000×10000 trwa to chwilę, ale tylko raz)
+ * ====================================================================== */
+static void verify_results(float par[MAX_USERS][MAX_USERS],
+                           float seq[MAX_USERS][MAX_USERS]) {
+    float max_err = 0.0f;
+    float sum_err = 0.0f;
+    for (int i = 0; i < num_users; i++)
+        for (int j = 0; j < num_users; j++) {
+            float e = fabsf(par[i][j] - seq[i][j]);
+            if (e > max_err) max_err = e;
+            sum_err += e;
         }
-        norms[u] = sqrt(sum);
-    }
+    float avg_err = sum_err / (float)(num_users * num_users);
+    printf("  Max blad:  %.2e\n", max_err);
+    printf("  Avg blad:  %.2e\n", avg_err);
+    printf("  Status:    %s\n", max_err < 1e-5f ? "OK (wyniki zgodne)" : "BLAD!");
 }
 
+/* =========================================================================
+ * REKOMENDACJE – user‑based collaborative filtering
+ * ====================================================================== */
+static void recommend_top_k(int target_user,
+                             float sim[MAX_USERS][MAX_USERS]) {
+    Rec recs[MAX_PRODUCTS];
+    int n_recs = 0;
 
+    for (int p = 0; p < num_products; p++) {
+        if (ratings[target_user][p] > 0.0f) continue;   /* już oceniony */
 
-int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Użycie: %s <plik_ocen.csv>\n", argv[0]);
-        return 1;
+        float weighted = 0.0f;
+        float sim_sum  = 0.0f;
+
+        for (int v = 0; v < num_users; v++) {
+            if (v == target_user) continue;
+            if (ratings[v][p] < 1e-9f) continue;        /* nie ocenił p */
+
+            float s = sim[target_user][v];
+            if (s > 0.0f) {
+                weighted += s * ratings[v][p];
+                sim_sum  += s;
+            }
+        }
+
+        if (sim_sum > 1e-9f) {
+            recs[n_recs].product = p;
+            recs[n_recs].score   = weighted / sim_sum;
+            n_recs++;
+        }
     }
-    if (!load_ratings(argv[1])) {
-        fprintf(stderr, "Błąd wczytywania.\n");
-        return 1;
-    }
-    compute_norms();
 
-    printf("Pierwsze 10 norm wektorow ocen:\n");
-for (int i = 0; i < 10 && i < MAX_USERS; i++) {
-    printf("Uzytkownik %d: norma = %.4f\n", i+1, norms[i]);
+    /* sortowanie bąbelkowe malejąco */
+    for (int i = 0; i < n_recs - 1; i++)
+        for (int j = i + 1; j < n_recs; j++)
+            if (recs[j].score > recs[i].score) {
+                Rec tmp = recs[i];
+                recs[i] = recs[j];
+                recs[j] = tmp;
+            }
+
+    int show = n_recs < TOP_K ? n_recs : TOP_K;
+    printf("\n  %-12s  %-22s\n", "Produkt", "Przewidywana ocena");
+    printf("  %-12s  %-22s\n", "------------", "--------------------");
+    if (show == 0) {
+        printf("  (brak rekomendacji – użytkownik ocenił wszystkie produkty)\n");
+        return;
+    }
+    for (int i = 0; i < show; i++)
+        printf("  prod_%03d     %.4f\n", recs[i].product, recs[i].score);
 }
 
-    
-    for (int i = 0; i < MAX_USERS; i++) free(user_items[i]);
-    for (int p = 0; p < MAX_PRODS; p++) free(prod_users[p]);
+/* =========================================================================
+ * WCZYTYWANIE CSV w formacie: user_id,product_id,rating
+ * (indeksy od 1; plik może zawierać nagłówek – automatyczne pominięcie)
+ * ====================================================================== */
+static int load_csv(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) { perror(filename); return -1; }
+
+    /* zerowanie macierzy ocen */
+    memset(ratings, 0, sizeof(ratings));
+
+    char line[MAX_LINE];
+    int  line_no = 0;
+    int  loaded  = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        line_no++;
+        /* ewentualne usunięcie znaku nowej linii */
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strlen(line) == 0) continue;
+
+        /* pomiń nagłówek, jeśli zawiera "user" lub "User" */
+        if (line_no == 1 && (strstr(line, "user") != NULL || strstr(line, "User") != NULL))
+            continue;
+
+        int uid, pid;
+        float r;
+        if (sscanf(line, "%d,%d,%f", &uid, &pid, &r) != 3) {
+            fprintf(stderr, "Błąd formatu w linii %d: '%s'\n", line_no, line);
+            continue;
+        }
+        if (uid < 1 || uid > MAX_USERS || pid < 1 || pid > MAX_PRODUCTS) {
+            fprintf(stderr, "Pominięto linię %d: ID poza zakresem\n", line_no);
+            continue;
+        }
+        ratings[uid-1][pid-1] = r;
+        loaded++;
+    }
+    fclose(f);
+    printf("Wczytano %d ocen (rzadka macierz %dx%d)\n", loaded, MAX_USERS, MAX_PRODUCTS);
     return 0;
 }
