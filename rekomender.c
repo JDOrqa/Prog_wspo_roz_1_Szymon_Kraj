@@ -241,5 +241,87 @@ static int load_csv(const char *filename) {
     }
     fclose(f);
     printf("Wczytano %d ocen (rzadka macierz %dx%d)\n", loaded, MAX_USERS, MAX_PRODUCTS);
+    /* =========================================================================
+ * DIAGNOSTYKA – podgląd fragmentu macierzy podobieństw
+ * ====================================================================== */
+static void print_sim_preview(float sim[MAX_USERS][MAX_USERS], int n) {
+    if (n > num_users) n = num_users;
+    printf("\n  Podglad macierzy podobienstwa (lewy gorny rog %dx%d):\n", n, n);
+    printf("  %6s", "");
+    for (int j = 0; j < n; j++) printf("  u%02d  ", j);
+    printf("\n");
+    for (int i = 0; i < n; i++) {
+        printf("  u%02d: ", i);
+        for (int j = 0; j < n; j++) printf(" %5.3f", sim[i][j]);
+        printf("\n");
+    }
+}
+
+/* =========================================================================
+ * MAIN
+ * ====================================================================== */
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Uzycie: %s ratings.csv [user_id]\n", argv[0]);
+        fprintf(stderr, "  user_id domyslnie: 0 (pierwszy uzytkownik)\n");
+        return 1;
+    }
+
+    const char *csv_file   = argv[1];
+    int         target_usr = (argc > 2) ? atoi(argv[2]) : 0;
+
+    printf("\n=== Wczytywanie danych z %s ===\n", csv_file);
+    if (load_csv(csv_file) < 0) return 1;
+
+    if (target_usr < 0 || target_usr >= num_users) {
+        fprintf(stderr, "Blad: user_id %d poza zakresem [0, %d]\n",
+                target_usr, num_users - 1);
+        return 1;
+    }
+
+    /* pre‑obliczenie norm */
+    compute_norms();
+
+    /* ---- Pomiar czasu dla różnej liczby wątków ---- */
+    printf("\n=== Pomiar czasu budowania macierzy podobienstwa ===\n");
+    printf("  %-10s  %-16s  %-12s\n", "Watki", "Czas [s]", "Przyspieszenie");
+    printf("  %-10s  %-16s  %-12s\n", "----------", "----------------", "------------");
+
+    double t_seq = build_similarity_sequential(sim_seq);
+    printf("  %-10s  %-16.6f  %-12s\n", "sekw.", t_seq, "1.00x (bazowy)");
+
+    int thread_counts[] = {1, 2, 4};
+    for (int k = 0; k < 3; k++) {
+        int nt = thread_counts[k];
+        double t = build_similarity_parallel(nt, sim_par);
+        double spd = t_seq / t;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.2fx", spd);
+        printf("  %-10d  %-16.6f  %-12s\n", nt, t, buf);
+    }
+
+    /* Ostatni przebieg równoległy z 4 wątkami – używany dalej */
+    build_similarity_parallel(4, sim_par);
+
+    /* ---- Weryfikacja poprawności ---- */
+    printf("\n=== Weryfikacja (rownolegle vs sekwencyjnie) ===\n");
+    verify_results(sim_par, sim_seq);
+
+    /* ---- Podgląd fragmentu macierzy ---- */
+    print_sim_preview(sim_par, 5);
+
+    /* ---- Rekomendacje dla wskazanego użytkownika ---- */
+    int rated = 0;
+    for (int p = 0; p < num_products; p++)
+        if (ratings[target_usr][p] > 0.0f) rated++;
+    printf("\n=== Top-%d rekomendacji dla uzytkownika %d ===\n",
+           TOP_K, target_usr);
+    printf("  Uzytkownik %d ocenil %d / %d produktow.\n",
+           target_usr, rated, num_products);
+    recommend_top_k(target_usr, sim_par);
+
+    printf("\n=== Gotowe ===\n\n");
+    return 0;
+}
     return 0;
 }
